@@ -214,16 +214,6 @@ def clean(ctx):
         ctx.run(f'rm -f {mnt}')
     ctx.run(f'git clean -fdX')
 
-
-@task
-def setup_repo(ctx, repo_path, pcb_name=""):
-	ctx.run(f"cp example.gitignore {repo_path}/.gitignore")
-	ctx.run(f"ln tasks.py {repo_path}/tasks.py")
-	if pcb_name:
-		ctx.run(f"cp eagle_template.sch {repo_path}/{pcb_name}.sch")
-		ctx.run(f"cp eagle_template.brd {repo_path}/{pcb_name}.brd")
-
-
 # ---------------------------------------------------------------------------
 # Gerber / Excellon generation
 # ---------------------------------------------------------------------------
