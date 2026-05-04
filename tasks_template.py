@@ -25,5 +25,11 @@ _spec.loader.exec_module(_m)
 globals().update({k: v for k, v in vars(_m).items() if not k.startswith('_')})
 
 # ---------------------------------------------------------------------------
+# Optional dependencies
+# ---------------------------------------------------------------------------
+# step task (invoke step <file>.brd) requires cadquery:
+#   pip install cadquery
+
+# ---------------------------------------------------------------------------
 # Project-specific tasks (optional) — add them here.
 # ---------------------------------------------------------------------------

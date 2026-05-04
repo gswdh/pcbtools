@@ -95,6 +95,12 @@ def _parse_sch(sch_file):
 
 
 @task
+def bootstrap(ctx):
+    """Install Python dependencies required by pcbtools."""
+    ctx.run("pip install invoke pandas openpyxl")
+
+
+@task
 def all(ctx):
     schs = glob.glob("*.sch")
     for sch in schs:
@@ -1421,6 +1427,290 @@ def gerbers(ctx, brd_file):
                 zf.write(os.path.join(tmp, f), f)
 
     print(f"  → {zip_name}")
+
+
+# ---------------------------------------------------------------------------
+# STEP export from board outline (layer 20)
+# ---------------------------------------------------------------------------
+
+def _arc_midpoint(x1, y1, x2, y2, curve_deg):
+    """Return a point at the midpoint of the Eagle arc, for makeThreePointArc."""
+    cx, cy, r = _arc_center(x1, y1, x2, y2, curve_deg)
+    start_a = math.atan2(y1 - cy, x1 - cx)
+    end_a = math.atan2(y2 - cy, x2 - cx)
+    if curve_deg > 0:  # CCW
+        if end_a <= start_a:
+            end_a += 2 * math.pi
+    else:  # CW
+        if end_a >= start_a:
+            end_a -= 2 * math.pi
+    mid_a = (start_a + end_a) / 2
+    return cx + r * math.cos(mid_a), cy + r * math.sin(mid_a)
+
+
+def _chain_segments(segs, tol=1e-3):
+    """Chain wire segments into ordered closed loops.
+
+    Returns a list of loops; each loop is an ordered list of segment dicts
+    where each segment's x2,y2 connects to the next segment's x1,y1.
+    Segments are flipped (and curve negated) when needed to maintain continuity.
+    """
+    remaining = [dict(s) for s in segs]
+    loops = []
+    while remaining:
+        loop = [remaining.pop(0)]
+        while True:
+            ex, ey = loop[-1]['x2'], loop[-1]['y2']
+            if len(loop) > 1 and math.hypot(loop[0]['x1'] - ex, loop[0]['y1'] - ey) < tol:
+                break  # closed
+            found = False
+            for i, s in enumerate(remaining):
+                if math.hypot(s['x1'] - ex, s['y1'] - ey) < tol:
+                    loop.append(remaining.pop(i))
+                    found = True
+                    break
+                if math.hypot(s['x2'] - ex, s['y2'] - ey) < tol:
+                    c = s['curve']
+                    loop.append({'x1': s['x2'], 'y1': s['y2'],
+                                 'x2': s['x1'], 'y2': s['y1'],
+                                 'curve': -c if c is not None else None})
+                    remaining.pop(i)
+                    found = True
+                    break
+            if not found:
+                break
+        loops.append(loop)
+    return loops
+
+
+def _loop_area(loop):
+    """Shoelace area estimate (straight-segment approximation) for loop sorting."""
+    area = 0.0
+    for s in loop:
+        area += s['x1'] * s['y2'] - s['x2'] * s['y1']
+    return abs(area) / 2
+
+
+def _build_component_bodies(root, board_thickness):
+    """Return list of (solid, name) for components that have a HEIGHT attribute.
+
+    Board occupies z=0 (top face) to z=-board_thickness (bottom face).
+    Top components extrude upward from z=0; bottom components extrude downward
+    from z=-board_thickness.
+
+    Silk outline priority: closed wire loops → circles → bounding box of wires.
+    """
+    try:
+        import cadquery as cq
+    except ImportError:
+        return []
+
+    # Library lookup: pkg_name -> [primitives], deviceset/device -> height_mm
+    lib_packages = {}
+    lib_heights = {}
+    libraries = root.find('.//libraries')
+    if libraries is not None:
+        for lib in libraries.findall('library'):
+            lname = lib.get('name')
+            lib_packages[lname] = {}
+            lib_heights[lname] = {}
+            for pkg in lib.findall('.//package'):
+                lib_packages[lname][pkg.get('name')] = _package_primitives(pkg)
+            for ds in lib.findall('.//deviceset'):
+                ds_map = {}
+                for dev in ds.findall('.//device'):
+                    dev_name = dev.get('name', '')
+                    for tech in dev.findall('.//technology'):
+                        for attr in tech.findall('attribute'):
+                            if attr.get('name', '').upper() == 'HEIGHT':
+                                try:
+                                    ds_map[dev_name] = float(attr.get('value', '0'))
+                                except ValueError:
+                                    pass
+                lib_heights[lname][ds.get('name')] = ds_map
+
+    bodies = []
+    elements_section = root.find('.//board/elements')
+    if elements_section is None:
+        return bodies
+
+    for el in elements_section.findall('element'):
+        el_name = el.get('name')
+        lname    = el.get('library')
+        pkg_name = el.get('package')
+        ds_name  = el.get('deviceset', '')
+        dev_name = el.get('device', '')
+        ex = float(el.get('x', 0))
+        ey = float(el.get('y', 0))
+        mirrored, angle = _parse_rot(el.get('rot', 'R0'))
+
+        # HEIGHT: per-instance attribute wins over library default
+        height = None
+        for attr in el.findall('attribute'):
+            if attr.get('name', '').upper() == 'HEIGHT':
+                try:
+                    height = float(attr.get('value', '0'))
+                except ValueError:
+                    pass
+        if height is None:
+            height = lib_heights.get(lname, {}).get(ds_name, {}).get(dev_name)
+        if not height or height <= 0:
+            height = 1.0
+
+        pkg_prims = lib_packages.get(lname, {}).get(pkg_name, [])
+        # Layer 21 = tPlace in package definition; mirroring flips to 22 on board,
+        # but the library always stores it as 21 — we transform coordinates instead.
+        silk_wires   = [p for p in pkg_prims if p['type'] == 'wire'   and p['layer'] == 21]
+        silk_circles = [p for p in pkg_prims if p['type'] == 'circle' and p['layer'] == 21]
+
+        # Transform wire endpoints to board space
+        segs = []
+        for w in silk_wires:
+            x1, y1 = _transform_point(w['x1'], w['y1'], ex, ey, mirrored, angle)
+            x2, y2 = _transform_point(w['x2'], w['y2'], ex, ey, mirrored, angle)
+            curve = w.get('curve')
+            if mirrored and curve is not None:
+                curve = -curve
+            if math.hypot(x2 - x1, y2 - y1) < 1e-6:
+                continue
+            segs.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'curve': curve})
+
+        try:
+            solid = None
+
+            # --- attempt 1: closed silk wire loops ---
+            if segs:
+                loops = _chain_segments(segs)
+                closed = sorted(
+                    [l for l in loops
+                     if math.hypot(l[0]['x1'] - l[-1]['x2'], l[0]['y1'] - l[-1]['y2']) < 1e-3],
+                    key=_loop_area, reverse=True,
+                )
+                if closed:
+                    cq_wires = []
+                    for loop in closed:
+                        edges = []
+                        for seg in loop:
+                            p1 = cq.Vector(seg['x1'], seg['y1'], 0)
+                            p2 = cq.Vector(seg['x2'], seg['y2'], 0)
+                            if seg['curve'] is None:
+                                edges.append(cq.Edge.makeLine(p1, p2))
+                            else:
+                                mx, my = _arc_midpoint(
+                                    seg['x1'], seg['y1'], seg['x2'], seg['y2'], seg['curve'])
+                                edges.append(cq.Edge.makeThreePointArc(
+                                    p1, cq.Vector(mx, my, 0), p2))
+                        cq_wires.append(cq.Wire.assembleEdges(edges))
+                    solid = cq.Solid.extrudeLinear(
+                        cq_wires[0], cq_wires[1:], cq.Vector(0, 0, height))
+
+            # --- attempt 2: silk circle → cylinder ---
+            if solid is None and silk_circles:
+                c = silk_circles[0]
+                cx, cy = _transform_point(c['x'], c['y'], ex, ey, mirrored, angle)
+                solid = cq.Solid.makeCylinder(c['radius'], height, cq.Vector(cx, cy, 0))
+
+            # --- attempt 3: axis-aligned bounding box of all silk wires ---
+            if solid is None and segs:
+                all_x = [s['x1'] for s in segs] + [s['x2'] for s in segs]
+                all_y = [s['y1'] for s in segs] + [s['y2'] for s in segs]
+                xmin, xmax = min(all_x), max(all_x)
+                ymin, ymax = min(all_y), max(all_y)
+                if xmax - xmin > 1e-6 and ymax - ymin > 1e-6:
+                    solid = cq.Solid.makeBox(
+                        xmax - xmin, ymax - ymin, height, cq.Vector(xmin, ymin, 0))
+
+            if solid is None:
+                continue
+
+            # Bottom-side components sit on z=-board_thickness, extend downward
+            if mirrored:
+                solid = solid.translate(cq.Vector(0, 0, -board_thickness - height))
+
+            bodies.append((solid, el_name))
+
+        except Exception as e:
+            print(f"  Warning: skipping {el_name}: {e}")
+
+    return bodies
+
+
+@task
+def step(ctx, brd_file, output=None, thickness=1.6):
+    """Export a STEP file of the PCB with component bodies where HEIGHT is defined.
+
+    Requires cadquery: pip install cadquery
+    """
+    try:
+        import cadquery as cq
+    except ImportError:
+        print("cadquery is required: pip install cadquery")
+        return
+
+    if output is None:
+        output = brd_file.replace('.brd', '.step')
+
+    tree = ET.parse(brd_file)
+    root = tree.getroot()
+
+    segs = []
+    plain = root.find('.//board/plain')
+    if plain is not None:
+        for w in plain.findall('wire'):
+            if int(w.get('layer')) != 20:
+                continue
+            x1, y1 = float(w.get('x1')), float(w.get('y1'))
+            x2, y2 = float(w.get('x2')), float(w.get('y2'))
+            if math.hypot(x2 - x1, y2 - y1) < 1e-6:
+                continue
+            segs.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                         'curve': float(w.get('curve')) if w.get('curve') else None})
+
+    if not segs:
+        print("No layer 20 (Dimension) wires found.")
+        return
+
+    loops = _chain_segments(segs)
+    closed_loops = []
+    for loop in loops:
+        gap = math.hypot(loop[0]['x1'] - loop[-1]['x2'], loop[0]['y1'] - loop[-1]['y2'])
+        if gap > 1e-3:
+            print(f"  Warning: skipping open chain of {len(loop)} segment(s) (gap {gap:.3f} mm)")
+        else:
+            closed_loops.append(loop)
+    loops = closed_loops
+    print(f"  {len(segs)} segments → {len(loops)} closed loop(s)")
+
+    cq_wires = []
+    for loop in loops:
+        edges = []
+        for seg in loop:
+            p1 = cq.Vector(seg['x1'], seg['y1'], 0)
+            p2 = cq.Vector(seg['x2'], seg['y2'], 0)
+            if seg['curve'] is None:
+                edges.append(cq.Edge.makeLine(p1, p2))
+            else:
+                mx, my = _arc_midpoint(seg['x1'], seg['y1'],
+                                       seg['x2'], seg['y2'], seg['curve'])
+                edges.append(cq.Edge.makeThreePointArc(p1, cq.Vector(mx, my, 0), p2))
+        cq_wires.append((cq.Wire.assembleEdges(edges), loop))
+
+    cq_wires.sort(key=lambda t: _loop_area(t[1]), reverse=True)
+    outer_wire = cq_wires[0][0]
+    inner_wires = [w for w, _ in cq_wires[1:]]
+
+    pcb_solid = cq.Solid.extrudeLinear(outer_wire, inner_wires, cq.Vector(0, 0, -thickness))
+
+    print("  Building component bodies...")
+    comp_bodies = _build_component_bodies(root, thickness)
+    print(f"  {len(comp_bodies)} component body/bodies")
+
+    assy = cq.Assembly()
+    assy.add(pcb_solid, name="PCB")
+    for comp_solid, comp_name in comp_bodies:
+        assy.add(comp_solid, name=comp_name)
+    assy.save(output)
+    print(f"  → {output}")
 
 
 @task
