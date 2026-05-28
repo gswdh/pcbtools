@@ -7,7 +7,7 @@ CAM/ULP workflows — no Eagle installation required at build time.
 
 | Task | Input | Output | Description |
 |------|-------|--------|-------------|
-| `bom` | `*.sch` | `*_bom.xlsx` | Bill of materials with Comment, Designator, Footprint, LCSC columns. Parts marked `NO FIT` are preserved as-is. |
+| `bom` | `*.sch` | `*_bom.xlsx` | Bill of materials. Always includes Comment, Value, Designator, Quantity, Footprint, LCSC; plus a column for every other component attribute present (Manufacturer, Digikey, Farnell, Tolerance, Voltage, Power, Temp Co, Height, …). Parts marked `NO FIT` are preserved as-is. |
 | `cpl` | `*.brd` | `*_cpl.csv` | Pick-and-place centroid file with Designator, Mid X/Y, Layer, Rotation. |
 | `gerbers` | `*.brd` | `*_<date>_<hash>.zip` | Full RS-274X Gerber + Excellon drill package (copper, soldermask, paste, silkscreen, outline). |
 | `pins` | `*.sch` | stdout / pickle | All nets connected to every pin of a named part. |

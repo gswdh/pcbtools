@@ -19,7 +19,10 @@ def _natural_sort_key(s):
 def _parse_sch(sch_file):
     """Parse an EAGLE .sch XML file and return a list of part dicts.
 
-    Each dict has keys: name, value, device, package, lcsc.
+    Each dict has keys: name, value, device, package, lcsc, attrs.
+    `attrs` is the full merged attribute dict (library technology attributes
+    overridden by part-level attributes) — e.g. MANUFACTURER, DIGIKEY,
+    TOLERANCE, VOLTAGE, HEIGHT, etc.
     Parts without a physical package (e.g. GND/VCC symbols) are excluded.
     """
     tree = ET.parse(sch_file)
@@ -89,6 +92,7 @@ def _parse_sch(sch_file):
             'device': ds_name,
             'package': package,
             'lcsc': attrs.get('LCSC', ''),
+            'attrs': attrs,
         })
 
     return parts_data
@@ -136,17 +140,37 @@ def bom(ctx, sch_file, output=None):
         groups[key].append(p['name'])
         group_meta[key] = p
 
+    # Extra attribute columns: the union of attributes present across all parts,
+    # excluding the display placeholders (NAME/VALUE) and those already shown as
+    # dedicated columns (LCSC). Known purchasing/spec attributes are ordered
+    # first; anything else follows alphabetically so new attributes surface
+    # automatically without a code change.
+    _KNOWN_ATTR_ORDER = ['MANUFACTURER', 'DIGIKEY', 'FARNELL', 'TOLERANCE',
+                         'VOLTAGE', 'POWER', 'TEMP_CO', 'HEIGHT', 'PRICE_PER',
+                         'STOCK']
+    _SKIP_ATTRS = {'NAME', 'VALUE', 'LCSC'}
+    present = set()
+    for p in parts_data:
+        present.update(k for k in p['attrs'] if k not in _SKIP_ATTRS)
+    extra_attrs = [a for a in _KNOWN_ATTR_ORDER if a in present]
+    extra_attrs += sorted(a for a in present if a not in _KNOWN_ATTR_ORDER)
+
     rows = []
     for key in sorted(groups.keys()):
         meta = group_meta[key]
         designators = sorted(groups[key], key=_natural_sort_key)
         no_fit = meta['value'].strip().upper() == 'NO FIT'
-        rows.append({
+        row = {
             'Comment': 'NO FIT' if no_fit else meta['device'],
+            'Value': meta['value'],
             'Designator': ', '.join(designators),
+            'Quantity': len(designators),
             'Footprint': meta['package'],
             'LCSC': 'NO FIT' if no_fit else meta['lcsc'],
-        })
+        }
+        for a in extra_attrs:
+            row[a.replace('_', ' ').title()] = meta['attrs'].get(a, '')
+        rows.append(row)
 
     df = pd.DataFrame(rows)
     if output is None:
@@ -218,7 +242,24 @@ def clean(ctx):
     for mnt in mnts:
         print(f"Removing {mnt}")
         ctx.run(f'rm -f {mnt}')
-    ctx.run(f'git clean -fdX')
+    # Remove generated build artifacts only.
+    #
+    # Do NOT use `git clean -fdX` here: a typical PCB project .gitignore is `*`
+    # (ignore everything except the EAGLE sources), so -X would also wipe the
+    # Python environment and tooling — .venv/, pyproject.toml, uv.lock,
+    # .python-version, README.md, etc. Delete known artifact patterns instead.
+    artifact_globs = [
+        "*.zip",                                            # fab gerber bundles
+        "*.step", "*.stp",                                  # 3D models
+        "*.dri", "*.gpi",                                   # EAGLE CAM logs
+        "*.GTL", "*.GBL", "*.G1", "*.G2", "*.G3", "*.G4",   # loose gerbers
+        "*.GTS", "*.GBS", "*.GTP", "*.GBP",
+        "*.GTO", "*.GBO", "*.GKO", "*.XLN",
+    ]
+    for pattern in artifact_globs:
+        for f in glob.glob(pattern):
+            print(f"Removing {f}")
+            ctx.run(f'rm -f "{f}"')
 
 # ---------------------------------------------------------------------------
 # Gerber / Excellon generation
@@ -1700,6 +1741,39 @@ def step(ctx, brd_file, output=None, thickness=1.6):
     inner_wires = [w for w, _ in cq_wires[1:]]
 
     pcb_solid = cq.Solid.extrudeLinear(outer_wire, inner_wires, cq.Vector(0, 0, -thickness))
+
+    drills = []
+    plain = root.find('.//board/plain')
+    if plain is not None:
+        for h in plain.findall('hole'):
+            drills.append((float(h.get('x')), float(h.get('y')), float(h.get('drill')) / 2))
+    for via in root.findall('.//board/signals/signal/via'):
+        drills.append((float(via.get('x')), float(via.get('y')), float(via.get('drill')) / 2))
+    elements_section = root.find('.//board/elements')
+    if elements_section is not None:
+        for el in elements_section.findall('element'):
+            lname = el.get('library')
+            pkg_name = el.get('package')
+            ex = float(el.get('x', 0))
+            ey = float(el.get('y', 0))
+            mirrored, angle = _parse_rot(el.get('rot', 'R0'))
+            pkg = root.find(f'.//libraries/library[@name="{lname}"]/packages/package[@name="{pkg_name}"]')
+            if pkg is None:
+                continue
+            for h in pkg.findall('hole'):
+                hx, hy = _transform_point(float(h.get('x', 0)), float(h.get('y', 0)), ex, ey, mirrored, angle)
+                drills.append((hx, hy, float(h.get('drill')) / 2))
+            for pad in pkg.findall('pad'):
+                if pad.get('drill'):
+                    px, py = _transform_point(float(pad.get('x', 0)), float(pad.get('y', 0)), ex, ey, mirrored, angle)
+                    drills.append((px, py, float(pad.get('drill')) / 2))
+    if drills:
+        print(f"  Cutting {len(drills)} drill hole(s)...")
+        drill_solids = []
+        for x, y, r in drills:
+            drill_wire = cq.Wire.makeCircle(r, cq.Vector(x, y, 1), cq.Vector(0, 0, 1))
+            drill_solids.append(cq.Solid.extrudeLinear(drill_wire, [], cq.Vector(0, 0, -(thickness + 2))))
+        pcb_solid = pcb_solid.cut(cq.Compound.makeCompound(drill_solids))
 
     print("  Building component bodies...")
     comp_bodies = _build_component_bodies(root, thickness)
