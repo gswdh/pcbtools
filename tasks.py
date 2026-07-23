@@ -113,6 +113,7 @@ def all(ctx):
     for brd in brds:
         cpl(ctx, brd)
         gerbers(ctx, brd)
+        images(ctx, brd)
     clean(ctx)
 
 
@@ -553,6 +554,34 @@ def _emit_text(layers, prim, text_str, ex, ey, el_mirrored, el_angle):
             cursor_x += adv * scale
 
 
+def _emit_label(layers, override, pkg_prim, text_str, ex, ey, mirrored, angle):
+    """Emit an element NAME / VALUE label.
+
+    When the element is smashed its label has been individually moved, and EAGLE
+    stores the new placement as an <attribute> on the element with absolute
+    board-frame coordinates, size, layer and rotation. Use that override when
+    present; otherwise fall back to the package's >NAME / >VALUE placeholder
+    transformed by the element placement.
+    """
+    if not text_str:
+        return
+    if override is not None:
+        if (override.get('display') or '').lower() == 'off':
+            return
+        oprim = {
+            'x': float(override.get('x', 0)),
+            'y': float(override.get('y', 0)),
+            'size': float(override.get('size', pkg_prim.get('size', 1.27))),
+            'layer': int(override.get('layer', pkg_prim['layer'])),
+            'ratio': float(override.get('ratio', pkg_prim.get('ratio', 8))),
+            'rot': override.get('rot', 'R0'),
+        }
+        # Coordinates are already absolute, so no element transform is applied.
+        _emit_text(layers, oprim, text_str, 0, 0, False, 0)
+    else:
+        _emit_text(layers, pkg_prim, text_str, ex, ey, mirrored, angle)
+
+
 def _smd_aperture_key(dx, dy, roundness):
     """Return (aperture_type, w, h) for an SMD pad."""
     r = float(roundness) if roundness else 0
@@ -812,6 +841,9 @@ def _collect_board_primitives(root):
             rot_str = el.get('rot', 'R0')
             mirrored, angle = _parse_rot(rot_str)
 
+            # Per-element attribute overrides (smashed NAME/VALUE placement).
+            el_overrides = {a.get('name'): a for a in el.findall('attribute')}
+
             pkg_prims = lib_packages.get(lib_name, {}).get(pkg_name, [])
             for prim in pkg_prims:
                 t = prim['type']
@@ -838,10 +870,13 @@ def _collect_board_primitives(root):
                 elif t == 'text':
                     txt_str = prim['text']
                     if txt_str == '>NAME':
-                        txt_str = el_name
+                        _emit_label(layers, el_overrides.get('NAME'), prim,
+                                    el_name, ex, ey, mirrored, angle)
                     elif txt_str == '>VALUE':
-                        txt_str = el.get('value', '')
-                    _emit_text(layers, prim, txt_str, ex, ey, mirrored, angle)
+                        _emit_label(layers, el_overrides.get('VALUE'), prim,
+                                    el.get('value', ''), ex, ey, mirrored, angle)
+                    else:
+                        _emit_text(layers, prim, txt_str, ex, ey, mirrored, angle)
 
     return layers
 
@@ -1956,3 +1991,362 @@ def pins_compare(ctx, old, new, deltas=False, output=None):
 
 	# Print the full dataframe
 	print(df_merged.to_string())
+
+
+# ---------------------------------------------------------------------------
+# Vector image export (SVG, optional PDF)
+# ---------------------------------------------------------------------------
+#
+# Six images are produced per board: top/bottom × {copper, silkscreen,
+# exposed copper}. Each image also carries the board outline (dimension layer).
+# Rendering reuses _collect_board_primitives() — the same parser the Gerber
+# export uses — so the images match the fab output exactly. Copper pours are
+# rendered with the same fill → clear-foreign-net → redraw painter model that
+# _write_gerber() uses (LPD/LPC/LPD), so isolation gaps appear correctly.
+
+_IMG_COPPER  = '#b87333'   # copper traces / pours / pads
+_IMG_SILK    = '#1f1f1f'   # silkscreen
+_IMG_EXPOSED = '#d4a017'   # exposed copper (soldermask openings)
+_IMG_OUTLINE = '#333333'   # board outline / dimension layer
+_IMG_BG      = '#ffffff'
+
+# suffix, side, eagle layers, fill colour, knock out drill holes?
+_IMAGE_VIEWS = [
+    ('top_copper',           'top',    [1, 17, 18],  _IMG_COPPER,  True),
+    ('bottom_copper',        'bottom', [16, 17, 18], _IMG_COPPER,  True),
+    ('top_silkscreen',       'top',    [21, 25],     _IMG_SILK,    False),
+    ('bottom_silkscreen',    'bottom', [22, 26],     _IMG_SILK,    False),
+    ('top_exposed_copper',   'top',    [29],         _IMG_EXPOSED, True),
+    ('bottom_exposed_copper','bottom', [30],         _IMG_EXPOSED, True),
+]
+
+
+def _tessellate_arc(x1, y1, x2, y2, curve_deg, step_deg=4.0):
+    """Sample an Eagle arc (start, end, included angle) into (x, y) points."""
+    if not curve_deg:
+        return [(x1, y1), (x2, y2)]
+    cx, cy, r = _arc_center(x1, y1, x2, y2, curve_deg)
+    if r >= 1e8 or r <= 0:
+        return [(x1, y1), (x2, y2)]
+    a1 = math.atan2(y1 - cy, x1 - cx)
+    sweep = math.radians(curve_deg)
+    n = max(1, int(math.ceil(abs(curve_deg) / step_deg)))
+    return [(cx + r * math.cos(a1 + sweep * i / n),
+             cy + r * math.sin(a1 + sweep * i / n)) for i in range(n + 1)]
+
+
+def _f(v):
+    return f"{v:.4f}"
+
+
+def _svg_circle(cx, cy, r, fill):
+    return f'<circle cx="{_f(cx)}" cy="{_f(cy)}" r="{_f(r)}" fill="{fill}"/>'
+
+
+def _svg_rect(cx, cy, w, h, angle, fill, rx=0.0):
+    x, y = cx - w / 2, cy - h / 2
+    tr = f' transform="rotate({angle:.4f} {_f(cx)} {_f(cy)})"' if abs(angle) > 1e-6 else ''
+    rxs = f' rx="{_f(rx)}" ry="{_f(rx)}"' if rx > 0 else ''
+    return (f'<rect x="{_f(x)}" y="{_f(y)}" width="{_f(w)}" height="{_f(h)}"'
+            f'{rxs} fill="{fill}"{tr}/>')
+
+
+def _svg_flash(p, fill, iso=0.0):
+    """A pad/via/smd as a filled SVG shape, optionally expanded by iso (mm).
+
+    Through-hole pads and vias are drawn as circles of their diameter, matching
+    the Gerber export (which uses a round aperture for every pad/via).
+    """
+    t = p['type']
+    if t in ('via', 'pad'):
+        return _svg_circle(p['x'], p['y'], p['diameter'] / 2 + iso, fill)
+    if t == 'smd':
+        dx, dy = p['dx'] + 2 * iso, p['dy'] + 2 * iso
+        rnd = p.get('roundness', 0.0)
+        if rnd >= 100:
+            rx = min(dx, dy) / 2          # fully rounded (circle / stadium)
+        elif rnd > 0:
+            rx = (rnd / 100.0) * min(dx, dy) / 2
+        else:
+            rx = 0.0                      # sharp rectangle
+        return _svg_rect(p['x'], p['y'], dx, dy, p.get('angle', 0.0), fill, rx)
+    return ''
+
+
+def _svg_wire(p, color, extra=0.0):
+    """A wire as a stroked SVG polyline (tessellated if curved)."""
+    w = max(p['width'] + extra, 0.01)
+    pts = _tessellate_arc(p['x1'], p['y1'], p['x2'], p['y2'], p.get('curve'))
+    d = "M " + " L ".join(f"{_f(x)} {_f(y)}" for x, y in pts)
+    return (f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{_f(w)}" '
+            f'stroke-linecap="round" stroke-linejoin="round"/>')
+
+
+def _svg_polygon(p, fill):
+    pts = []
+    verts = p['vertices']
+    for i, v in enumerate(verts):
+        nxt = verts[(i + 1) % len(verts)]
+        if v.get('curve'):
+            pts.extend(_tessellate_arc(v['x'], v['y'], nxt['x'], nxt['y'], v['curve'])[:-1])
+        else:
+            pts.append((v['x'], v['y']))
+    if not pts:
+        return ''
+    d = "M " + " L ".join(f"{_f(x)} {_f(y)}" for x, y in pts) + " Z"
+    w = p.get('width', 0) or 0
+    stroke = f' stroke="{fill}" stroke-width="{_f(w)}" stroke-linejoin="round"' if w > 0 else ''
+    return f'<path d="{d}" fill="{fill}"{stroke}/>'
+
+
+def _svg_circle_prim(p, color):
+    if p['width'] <= 0:
+        return _svg_circle(p['x'], p['y'], p['radius'], color)
+    return (f'<circle cx="{_f(p["x"])}" cy="{_f(p["y"])}" r="{_f(p["radius"])}" '
+            f'fill="none" stroke="{color}" stroke-width="{_f(p["width"])}"/>')
+
+
+def _render_feature_layer(prims, color, bg, knockout_drills, drills):
+    """Render one set of primitives in a single colour to SVG element strings,
+    replicating the Gerber pour/clearance painter model so isolation gaps show.
+    """
+    out = []
+    deco_polys = [p for p in prims if p['type'] == 'polygon' and p.get('isolate') is None]
+    pours      = [p for p in prims if p['type'] == 'polygon' and p.get('isolate') is not None]
+    pads       = [p for p in prims if p['type'] in ('via', 'pad', 'smd')]
+    wires      = [p for p in prims if p['type'] == 'wire']
+    circles    = [p for p in prims if p['type'] == 'circle']
+    rects      = [p for p in prims if p['type'] == 'rectangle']
+
+    # Decorative (non-pour) polygons
+    for p in deco_polys:
+        out.append(_svg_polygon(p, color))
+
+    # Pours: solid fill, then clear foreign-net features in the background colour.
+    # The features are redrawn in copper below, restoring copper inside the gaps.
+    for pour in pours:
+        iso = pour.get('isolate') or 0.25
+        net = pour.get('net', '')
+        out.append(_svg_polygon(pour, color))
+        for p in pads:
+            if p.get('net', '') != net:
+                out.append(_svg_flash(p, bg, iso))
+        for p in wires:
+            if p.get('net', '') != net:
+                out.append(_svg_wire(p, bg, extra=2 * iso))
+
+    # Features in colour
+    for p in pads:
+        out.append(_svg_flash(p, color))
+    for p in rects:
+        out.append(_svg_rect(p['x'], p['y'], p['w'], p['h'], p.get('angle', 0.0), color))
+    for p in circles:
+        out.append(_svg_circle_prim(p, color))
+    for p in wires:
+        out.append(_svg_wire(p, color))
+
+    # Knock out drilled holes (annular rings on copper / exposed-copper views)
+    if knockout_drills:
+        for d in drills:
+            out.append(_svg_circle(d['x'], d['y'], d['drill'] / 2, bg))
+
+    return [e for e in out if e]
+
+
+def _render_outline(prims, color):
+    """Render the board outline / dimension layer as thin strokes."""
+    out = []
+    for p in prims:
+        if p['type'] == 'wire':
+            out.append(_svg_wire({**p, 'width': max(p['width'], 0.12)}, color))
+        elif p['type'] == 'circle':
+            w = p['width'] if p['width'] > 0 else 0.12
+            out.append(f'<circle cx="{_f(p["x"])}" cy="{_f(p["y"])}" r="{_f(p["radius"])}" '
+                       f'fill="none" stroke="{color}" stroke-width="{_f(w)}"/>')
+    return out
+
+
+def _layers_bbox(layers, layer_nums):
+    """Bounding box (minx, miny, maxx, maxy) over the given layers, or None."""
+    minx = miny = 1e18
+    maxx = maxy = -1e18
+    for ln in layer_nums:
+        for p in layers.get(ln, []):
+            t = p['type']
+            if t == 'wire':
+                pts = [(p['x1'], p['y1']), (p['x2'], p['y2'])]
+            elif t in ('via', 'pad'):
+                r = p['diameter'] / 2
+                pts = [(p['x'] - r, p['y'] - r), (p['x'] + r, p['y'] + r)]
+            elif t == 'smd':
+                hx, hy = p['dx'] / 2, p['dy'] / 2
+                pts = [(p['x'] - hx, p['y'] - hy), (p['x'] + hx, p['y'] + hy)]
+            elif t == 'circle':
+                r = p['radius']
+                pts = [(p['x'] - r, p['y'] - r), (p['x'] + r, p['y'] + r)]
+            elif t == 'rectangle':
+                r = max(p['w'], p['h']) / 2
+                pts = [(p['x'] - r, p['y'] - r), (p['x'] + r, p['y'] + r)]
+            elif t == 'polygon':
+                pts = [(v['x'], v['y']) for v in p['vertices']]
+            else:
+                continue
+            for x, y in pts:
+                minx, miny = min(minx, x), min(miny, y)
+                maxx, maxy = max(maxx, x), max(maxy, y)
+    if minx > maxx:
+        return None
+    return minx, miny, maxx, maxy
+
+
+def _outline_loops(prims, tol=0.02):
+    """Chain dimension-layer wires into closed loops of (x, y) points.
+
+    Returns (loops, circles): loops is a list of point lists (one per closed
+    contour), circles is a list of (cx, cy, r) for full-circle outlines (round
+    boards or circular cutouts). Arc wires are tessellated, reversed when the
+    loop is walked through them backwards.
+    """
+    segs = [p for p in prims if p['type'] == 'wire']
+    circles = [(p['x'], p['y'], p['radius']) for p in prims if p['type'] == 'circle']
+
+    def pts_of(seg, reverse):
+        if reverse:
+            c = -seg['curve'] if seg.get('curve') else None
+            return _tessellate_arc(seg['x2'], seg['y2'], seg['x1'], seg['y1'], c)
+        return _tessellate_arc(seg['x1'], seg['y1'], seg['x2'], seg['y2'], seg.get('curve'))
+
+    loops = []
+    used = [False] * len(segs)
+    for i in range(len(segs)):
+        if used[i]:
+            continue
+        used[i] = True
+        loop = pts_of(segs[i], False)
+        while True:
+            ex, ey = loop[-1]
+            for j in range(len(segs)):
+                if used[j]:
+                    continue
+                s = segs[j]
+                if math.hypot(s['x1'] - ex, s['y1'] - ey) <= tol:
+                    loop.extend(pts_of(s, False)[1:])
+                elif math.hypot(s['x2'] - ex, s['y2'] - ey) <= tol:
+                    loop.extend(pts_of(s, True)[1:])
+                else:
+                    continue
+                used[j] = True
+                break
+            else:
+                break
+        loops.append(loop)
+    return loops, circles
+
+
+def _clip_path_d(loops, circles):
+    """Build an SVG path 'd' (even-odd) describing the board region."""
+    parts = []
+    for loop in loops:
+        if len(loop) >= 3:
+            parts.append("M " + " L ".join(f"{_f(x)} {_f(y)}" for x, y in loop) + " Z")
+    for cx, cy, r in circles:
+        pts = [(cx + r * math.cos(2 * math.pi * k / 64),
+                cy + r * math.sin(2 * math.pi * k / 64)) for k in range(64)]
+        parts.append("M " + " L ".join(f"{_f(x)} {_f(y)}" for x, y in pts) + " Z")
+    return " ".join(parts)
+
+
+def _write_svg(path, features, outline, clip_d, bbox, side, margin=1.0):
+    """Write SVG. Eagle Y is up, so the whole drawing is flipped in Y; bottom
+    views are also flipped in X to read as seen from the bottom of the board.
+
+    Feature primitives are clipped to the board region (clip_d) so copper,
+    silkscreen and exposed copper never extend past the physical board edge;
+    the outline strokes are drawn on top, unclipped.
+    """
+    minx, miny, maxx, maxy = bbox
+    minx -= margin; miny -= margin; maxx += margin; maxy += margin
+    W, H = maxx - minx, maxy - miny
+    if side == 'bottom':
+        transform, vb_x = 'scale(-1,-1)', -maxx
+    else:
+        transform, vb_x = 'scale(1,-1)', minx
+    vb_y = -maxy
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W:.3f}mm" '
+        f'height="{H:.3f}mm" viewBox="{vb_x:.4f} {vb_y:.4f} {W:.4f} {H:.4f}">',
+    ]
+    if clip_d:
+        svg.append('<defs><clipPath id="board" clipPathUnits="userSpaceOnUse">'
+                   f'<path d="{clip_d}" clip-rule="evenodd"/></clipPath></defs>')
+    svg.append(f'<rect x="{vb_x:.4f}" y="{vb_y:.4f}" width="{W:.4f}" '
+               f'height="{H:.4f}" fill="{_IMG_BG}"/>')
+    svg.append(f'<g transform="{transform}">')
+    if clip_d:
+        svg.append('<g clip-path="url(#board)">')
+        svg.extend(features)
+        svg.append('</g>')
+    else:
+        svg.extend(features)
+    svg.extend(outline)
+    svg.append('</g>')
+    svg.append('</svg>')
+    with open(path, 'w') as f:
+        f.write('\n'.join(svg) + '\n')
+
+
+@task
+def images(ctx, brd_file, fmt='svg'):
+    """Render 6 vector images of the PCB from an EAGLE .brd (no Eagle required):
+    top/bottom × (copper, silkscreen, exposed copper). The board outline
+    (dimension layer) is drawn on every image.
+
+    Output is SVG. Pass --fmt=pdf to also write PDF (needs cairosvg:
+    `uv sync --extra image`, or `pip install cairosvg`).
+    """
+    print(f"Rendering images from {brd_file}")
+    tree = ET.parse(brd_file)
+    root = tree.getroot()
+    layers = _collect_board_primitives(root)
+    drills = layers.get('drill', [])
+
+    name = os.path.splitext(os.path.basename(brd_file))[0]
+    brd_dir = os.path.dirname(os.path.abspath(brd_file))
+
+    # Board extents from the dimension layer, falling back to copper extents.
+    outline_prims = layers.get(20, []) + layers.get(46, [])
+    bbox = _layers_bbox(layers, [20, 46]) or _layers_bbox(layers, [1, 16, 17, 18])
+    if bbox is None:
+        print("  No geometry found — nothing to render.")
+        return
+
+    # Clip path from the board outline so no feature spills past the board edge.
+    loops, circles = _outline_loops(outline_prims)
+    clip_d = _clip_path_d(loops, circles)
+    if not clip_d:
+        print("  Warning: no closed board outline on the dimension layer; "
+              "features will not be clipped to the board edge.")
+
+    svg_paths = []
+    for suffix, side, lyr_nums, color, knockout in _IMAGE_VIEWS:
+        prims = []
+        for ln in lyr_nums:
+            prims.extend(layers.get(ln, []))
+        features = _render_feature_layer(prims, color, _IMG_BG, knockout, drills)
+        outline = _render_outline(outline_prims, _IMG_OUTLINE)
+        svg_path = os.path.join(brd_dir, f"{name}_{suffix}.svg")
+        _write_svg(svg_path, features, outline, clip_d, bbox, side)
+        print(f"  Wrote {os.path.basename(svg_path)}")
+        svg_paths.append(svg_path)
+
+    if fmt.lower() == 'pdf':
+        try:
+            import cairosvg
+        except ImportError:
+            print("  --fmt=pdf needs cairosvg; keeping SVG only. "
+                  "Install with `uv sync --extra image`.")
+            return
+        for svg_path in svg_paths:
+            pdf_path = svg_path[:-4] + '.pdf'
+            cairosvg.svg2pdf(url=svg_path, write_to=pdf_path)
+            print(f"  Wrote {os.path.basename(pdf_path)}")

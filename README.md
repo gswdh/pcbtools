@@ -10,9 +10,10 @@ CAM/ULP workflows — no Eagle installation required at build time.
 | `bom` | `*.sch` | `*_bom.xlsx` | Bill of materials. Always includes Comment, Value, Designator, Quantity, Footprint, LCSC; plus a column for every other component attribute present (Manufacturer, Digikey, Farnell, Tolerance, Voltage, Power, Temp Co, Height, …). Parts marked `NO FIT` are preserved as-is. |
 | `cpl` | `*.brd` | `*_cpl.csv` | Pick-and-place centroid file with Designator, Mid X/Y, Layer, Rotation. |
 | `gerbers` | `*.brd` | `*_<date>_<hash>.zip` | Full RS-274X Gerber + Excellon drill package (copper, soldermask, paste, silkscreen, outline). |
+| `images` | `*.brd` | `*_<view>.svg` (`.pdf`) | Six vector images — top/bottom × copper, silkscreen, exposed copper — each with the board outline. Bottom views are mirrored to read from the bottom side. Add `--fmt=pdf` for PDF (needs the `image` extra). |
 | `pins` | `*.sch` | stdout / pickle | All nets connected to every pin of a named part. |
 | `pins-compare` | two pickles | stdout | Diff two pin connection snapshots. |
-| `all` | `*.sch`, `*.brd` | all of the above | Runs bom, cpl, and gerbers for every schematic/board in the working directory. |
+| `all` | `*.sch`, `*.brd` | all of the above | Runs bom, cpl, gerbers, and images for every schematic/board in the working directory. |
 | `process` | `<name>` | bom + cpl | Shorthand for bom + cpl on `<name>.sch` / `<name>.brd`. |
 | `clean` | — | — | Removes Eagle backup files and generated CSVs. |
 | `setup-repo` | repo path | — | Bootstraps a new Eagle repo with `.gitignore`, symlinked `tasks.py`, and optional blank schematic/board. |
